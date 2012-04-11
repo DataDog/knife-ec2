@@ -1,6 +1,7 @@
 #
 # Author:: Adam Jacob (<adam@opscode.com>)
-# Copyright:: Copyright (c) 2010 Opscode, Inc.
+# Author:: Seth Chisamore (<schisamo@opscode.com>)
+# Copyright:: Copyright (c) 2010-2011 Opscode, Inc.
 # License:: Apache License, Version 2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,20 +17,20 @@
 # limitations under the License.
 #
 
-require 'chef/knife'
+require 'chef/knife/ec2_base'
 
 class Chef
   class Knife
     class Ec2ServerCreate < Knife
 
+      include Knife::Ec2Base
+
       deps do
-        require 'chef/knife/bootstrap'
-        Chef::Knife::Bootstrap.load_deps
         require 'fog'
-        require 'socket'
-        require 'net/ssh/multi'
         require 'readline'
         require 'chef/json_compat'
+        require 'chef/knife/bootstrap'
+        Chef::Knife::Bootstrap.load_deps
       end
 
       banner "knife ec2 server create (options)"
@@ -85,22 +86,17 @@ class Chef
         :long => "--ssh-password PASSWORD",
         :description => "The ssh password"
 
+      option :ssh_port,
+        :short => "-p PORT",
+        :long => "--ssh-port PORT",
+        :description => "The ssh port",
+        :default => "22",
+        :proc => Proc.new { |key| Chef::Config[:knife][:ssh_port] = key }
+
       option :identity_file,
         :short => "-i IDENTITY_FILE",
         :long => "--identity-file IDENTITY_FILE",
         :description => "The SSH identity file used for authentication"
-
-      option :aws_access_key_id,
-        :short => "-A ID",
-        :long => "--aws-access-key-id KEY",
-        :description => "Your AWS Access Key ID",
-        :proc => Proc.new { |key| Chef::Config[:knife][:aws_access_key_id] = key }
-
-      option :aws_secret_access_key,
-        :short => "-K SECRET",
-        :long => "--aws-secret-access-key SECRET",
-        :description => "Your AWS API Secret Access Key",
-        :proc => Proc.new { |key| Chef::Config[:knife][:aws_secret_access_key] = key }
 
       option :prerelease,
         :long => "--prerelease",
@@ -110,12 +106,6 @@ class Chef
         :long => "--bootstrap-version VERSION",
         :description => "The version of Chef to install",
         :proc => Proc.new { |v| Chef::Config[:knife][:bootstrap_version] = v }
-
-      option :region,
-        :long => "--region REGION",
-        :description => "Your AWS region",
-        :default => "us-east-1",
-        :proc => Proc.new { |key| Chef::Config[:knife][:region] = key }
 
       option :distro,
         :short => "-d DISTRO",
@@ -157,8 +147,15 @@ class Chef
         :boolean => true,
         :default => false
 
+      option :aws_user_data,
+        :long => "--user-data USER_DATA_FILE",
+        :short => "-u USER_DATA_FILE",
+        :description => "The EC2 User Data file to provision the instance with",
+        :proc => Proc.new { |m| Chef::Config[:knife][:aws_user_data] = m },
+        :default => nil
+
       def tcp_test_ssh(hostname)
-        tcp_socket = TCPSocket.new(hostname, 22)
+        tcp_socket = TCPSocket.new(hostname, config[:ssh_port])
         readable = IO.select([tcp_socket], nil, nil, 5)
         if readable
           Chef::Log.debug("sshd accepting connections on #{hostname}, banner is #{tcp_socket.gets}")
@@ -167,7 +164,12 @@ class Chef
         else
           false
         end
+      rescue SocketError
+        sleep 2
+        false
       rescue Errno::ETIMEDOUT
+        false
+      rescue Errno::EPERM
         false
       rescue Errno::ECONNREFUSED
         sleep 2
@@ -181,152 +183,101 @@ class Chef
       end
 
       def run
-
         $stdout.sync = true
 
-        connection = Fog::Compute.new(
-          :provider => 'AWS',
-          :aws_access_key_id => Chef::Config[:knife][:aws_access_key_id],
-          :aws_secret_access_key => Chef::Config[:knife][:aws_secret_access_key],
-          :region => locate_config_value(:region)
-        )
+        validate!
 
-        ami = connection.images.get(locate_config_value(:image))
+        server = connection.servers.create(create_server_def)
 
-        if ami.nil?
-          ui.error("You have not provided a valid image (AMI) value.  Please note the short option for this value recently changed from '-i' to '-I'.")
-          exit 1
-        end
-
-        server_def = {
-          :image_id => locate_config_value(:image),
-          :groups => config[:security_groups],
-          :flavor_id => locate_config_value(:flavor),
-          :key_name => Chef::Config[:knife][:aws_ssh_key_id],
-          :availability_zone => Chef::Config[:knife][:availability_zone]
-        }
-        server_def[:subnet_id] = config[:subnet_id] if config[:subnet_id]
-
-      if ami.root_device_type == "ebs"
-        ami_map = ami.block_device_mapping.first
-        ebs_size = begin
-                     if config[:ebs_size]
-                       Integer(config[:ebs_size]).to_s
-                     else
-                       ami_map["volumeSize"].to_s
-                     end
-                   rescue ArgumentError
-                     puts "--ebs-size must be an integer"
-                     msg opt_parser
-                     exit 1
-                   end
-        delete_term = if config[:ebs_no_delete_on_term]
-                        "false"
-                      else
-                        ami_map["deleteOnTermination"]
-                      end
-        server_def[:block_device_mapping] =
-          [{
-             'DeviceName' => ami_map["deviceName"],
-             'Ebs.VolumeSize' => ebs_size,
-             'Ebs.DeleteOnTermination' => delete_term
-           }]
-      end
-        server = connection.servers.create(server_def)
-
-        puts "#{ui.color("Instance ID", :cyan)}: #{server.id}"
-        puts "#{ui.color("Flavor", :cyan)}: #{server.flavor_id}"
-        puts "#{ui.color("Image", :cyan)}: #{server.image_id}"
-        puts "#{ui.color("Availability Zone", :cyan)}: #{server.availability_zone}"
-        puts "#{ui.color("Security Groups", :cyan)}: #{server.groups.join(", ")}"
-        puts "#{ui.color("SSH Key", :cyan)}: #{server.key_name}"
-        puts "#{ui.color("Subnet ID", :cyan)}: #{server.subnet_id}" if vpc_mode?
+        msg_pair("Instance ID", server.id)
+        msg_pair("Flavor", server.flavor_id)
+        msg_pair("Image", server.image_id)
+        msg_pair("Region", connection.instance_variable_get(:@region))
+        msg_pair("Availability Zone", server.availability_zone)
+        msg_pair("Security Groups", server.groups.join(", "))
+        msg_pair("SSH Key", server.key_name)
 
         print "\n#{ui.color("Waiting for server", :magenta)}"
-
-        display_name = if vpc_mode?
-          server.private_ip_address
-        else
-          server.dns_name
-        end
 
         # wait for it to be ready to do stuff
         server.wait_for { print "."; ready? }
 
         puts("\n")
-
-        if !vpc_mode?
-          puts "#{ui.color("Public DNS Name", :cyan)}: #{server.dns_name}"
-          puts "#{ui.color("Public IP Address", :cyan)}: #{server.public_ip_address}"
-          puts "#{ui.color("Private DNS Name", :cyan)}: #{server.private_dns_name}"
+        
+        if vpc_mode?
+          msg_pair("Subnet ID", server.subnet_id)
+        else
+          msg_pair("Public DNS Name", server.dns_name)
+          msg_pair("Public IP Address", server.public_ip_address)
+          msg_pair("Private DNS Name", server.private_dns_name)
         end
-        puts "#{ui.color("Private IP Address", :cyan)}: #{server.private_ip_address}"
+        msg_pair("Private IP Address", server.private_ip_address)
 
         print "\n#{ui.color("Waiting for sshd", :magenta)}"
-
-        ip_to_test = vpc_mode? ? server.private_ip_address : server.public_ip_address
-        print(".") until tcp_test_ssh(ip_to_test) {
+        
+        fqdn = vpc_mode? ? server.private_ip_address : server.dns_name
+        
+        print(".") until tcp_test_ssh(fqdn) {
           sleep @initial_sleep_delay ||= (vpc_mode? ? 40 : 10)
           puts("done")
         }
 
-        bootstrap_for_node(server).run
+        bootstrap_for_node(server,fqdn).run
 
         puts "\n"
-        puts "#{ui.color("Instance ID", :cyan)}: #{server.id}"
-        puts "#{ui.color("Flavor", :cyan)}: #{server.flavor_id}"
-        puts "#{ui.color("Image", :cyan)}: #{server.image_id}"
-        puts "#{ui.color("Availability Zone", :cyan)}: #{server.availability_zone}"
-        puts "#{ui.color("Security Groups", :cyan)}: #{server.groups.join(", ")}"
-        if vpc_mode?
-          puts "#{ui.color("Subnet ID", :cyan)}: #{server.subnet_id}"
-        else
-          puts "#{ui.color("Public DNS Name", :cyan)}: #{server.dns_name}"
-          puts "#{ui.color("Public IP Address", :cyan)}: #{server.public_ip_address}"
-          puts "#{ui.color("Private DNS Name", :cyan)}: #{server.private_dns_name}"
-        end
-        puts "#{ui.color("SSH Key", :cyan)}: #{server.key_name}"
-        puts "#{ui.color("Private IP Address", :cyan)}: #{server.private_ip_address}"
-        puts "#{ui.color("Root Device Type", :cyan)}: #{server.root_device_type}"
+        msg_pair("Instance ID", server.id)
+        msg_pair("Flavor", server.flavor_id)
+        msg_pair("Image", server.image_id)
+        msg_pair("Region", connection.instance_variable_get(:@region))
+        msg_pair("Availability Zone", server.availability_zone)
+        msg_pair("Security Groups", server.groups.join(", "))
+        msg_pair("SSH Key", server.key_name)
+        msg_pair("Root Device Type", server.root_device_type)
         if server.root_device_type == "ebs"
           device_map = server.block_device_mapping.first
-          puts "#{ui.color("Root Volume ID", :cyan)}: #{device_map['volumeId']}"
-          puts "#{ui.color("Root Device Name", :cyan)}: #{device_map['deviceName']}"
-          puts "#{ui.color("Root Device Delete on Terminate", :cyan)}: #{device_map['deleteOnTermination']}"
+          msg_pair("Root Volume ID", device_map['volumeId'])
+          msg_pair("Root Device Name", device_map['deviceName'])
+          msg_pair("Root Device Delete on Terminate", device_map['deleteOnTermination'])
+
           if config[:ebs_size]
             if ami.block_device_mapping.first['volumeSize'].to_i < config[:ebs_size].to_i
-              puts ("#{ui.color("Warning", :yellow)}: #{config[:ebs_size]}GB " +
-                    "EBS volume size is larger than size set in AMI of " +
-                    "#{ami.block_device_mapping.first['volumeSize']}GB.\n" +
-                    "Use file system tools to make use of the increased volume size.")
+              volume_too_large_warning = "#{config[:ebs_size]}GB " +
+                          "EBS volume size is larger than size set in AMI of " +
+                          "#{ami.block_device_mapping.first['volumeSize']}GB.\n" +
+                          "Use file system tools to make use of the increased volume size."
+              msg_pair("Warning", volume_too_large_warning, :yellow)
             end
           end
         end
-        puts "#{ui.color("Environment", :cyan)}: #{config[:environment] || '_default'}"
-        puts "#{ui.color("Run List", :cyan)}: #{config[:run_list].join(', ')}"
+        if vpc_mode?
+          msg_pair("Subnet ID", server.subnet_id)
+        else
+          msg_pair("Public DNS Name", server.dns_name)
+          msg_pair("Public IP Address", server.public_ip_address)
+          msg_pair("Private DNS Name", server.private_dns_name)
+        end
+        msg_pair("Private IP Address", server.private_ip_address)
+        msg_pair("Environment", config[:environment] || '_default')
+        msg_pair("Run List", config[:run_list].join(', '))
       end
 
-      def bootstrap_for_node(server)
+      def bootstrap_for_node(server,fqdn)
         bootstrap = Chef::Knife::Bootstrap.new
-        bootstrap.name_args = [vpc_mode? ? server.private_ip_address : server.dns_name ]
+        bootstrap.name_args = [fqdn]
         bootstrap.config[:run_list] = config[:run_list]
         bootstrap.config[:ssh_user] = config[:ssh_user]
+        bootstrap.config[:ssh_port] = config[:ssh_port]
         bootstrap.config[:identity_file] = config[:identity_file]
         bootstrap.config[:chef_node_name] = config[:chef_node_name] || server.id
         bootstrap.config[:prerelease] = config[:prerelease]
         bootstrap.config[:bootstrap_version] = locate_config_value(:bootstrap_version)
         bootstrap.config[:distro] = locate_config_value(:distro)
-        bootstrap.config[:use_sudo] = true
+        bootstrap.config[:use_sudo] = true unless config[:ssh_user] == 'root'
         bootstrap.config[:template_file] = locate_config_value(:template_file)
         bootstrap.config[:environment] = config[:environment]
         # may be needed for vpc_mode
         bootstrap.config[:no_host_key_verify] = config[:no_host_key_verify]
         bootstrap
-      end
-
-      def locate_config_value(key)
-        key = key.to_sym
-        Chef::Config[:knife][key] || config[key]
       end
 
       def vpc_mode?
@@ -335,6 +286,66 @@ class Chef
         !!config[:subnet_id]
       end
 
+      def ami
+        @ami ||= connection.images.get(locate_config_value(:image))
+      end
+
+      def validate!
+
+        super([:image, :aws_ssh_key_id, :aws_access_key_id, :aws_secret_access_key])
+
+        if ami.nil?
+          ui.error("You have not provided a valid image (AMI) value.  Please note the short option for this value recently changed from '-i' to '-I'.")
+          exit 1
+        end
+      end
+      
+      def create_server_def
+        server_def = {
+          :image_id => locate_config_value(:image),
+          :groups => config[:security_groups],
+          :flavor_id => locate_config_value(:flavor),
+          :key_name => Chef::Config[:knife][:aws_ssh_key_id],
+          :availability_zone => locate_config_value(:availability_zone)
+        }
+        server_def[:subnet_id] = config[:subnet_id] if config[:subnet_id]
+
+        if Chef::Config[:knife][:aws_user_data]
+          begin
+            server_def.merge!(:user_data => File.read(Chef::Config[:knife][:aws_user_data]))
+          rescue
+            ui.warn("Cannot read #{Chef::Config[:knife][:aws_user_data]}: #{$!.inspect}. Ignoring option.")
+          end
+        end
+
+        if ami.root_device_type == "ebs"
+          ami_map = ami.block_device_mapping.first
+          ebs_size = begin
+                       if config[:ebs_size]
+                         Integer(config[:ebs_size]).to_s
+                       else
+                         ami_map["volumeSize"].to_s
+                       end
+                     rescue ArgumentError
+                       puts "--ebs-size must be an integer"
+                       msg opt_parser
+                       exit 1
+                     end
+          delete_term = if config[:ebs_no_delete_on_term]
+                          "false"
+                        else
+                          ami_map["deleteOnTermination"]
+                        end
+          server_def[:block_device_mapping] =
+            [{
+               'DeviceName' => ami_map["deviceName"],
+               'Ebs.VolumeSize' => ebs_size,
+               'Ebs.DeleteOnTermination' => delete_term
+             }]
+        end
+        
+        server_def
+      end
     end
   end
 end

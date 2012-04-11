@@ -17,15 +17,26 @@
 #
 
 require File.expand_path('../../spec_helper', __FILE__)
+require 'fog'
+require 'chef/knife/bootstrap'
 
 describe Chef::Knife::Ec2ServerCreate do
   before do
-    @knife_ec2_create = Chef::Knife::Ec2ServerCreate.new()
-    @knife_ec2_create.name_args = ['role[base]']
+    @knife_ec2_create = Chef::Knife::Ec2ServerCreate.new
     @knife_ec2_create.initial_sleep_delay = 0
     @knife_ec2_create.stub!(:tcp_test_ssh).and_return(true)
 
-    @ec2_connection = mock()
+    {
+      :image => 'image',
+      :aws_ssh_key_id => 'aws_ssh_key_id',
+      :aws_access_key_id => 'aws_access_key_id',
+      :aws_secret_access_key => 'aws_secret_access_key'
+    }.each do |key, value|
+      Chef::Config[:knife][key] = value
+    end
+    
+    @ec2_connection = mock(Fog::AWS::Compute)
+    @ec2_connection.stub_chain(:images, :get).and_return mock('ami', :root_device_type => 'not_ebs')
     @ec2_servers = mock()
     @new_ec2_server = mock()
 
@@ -36,9 +47,10 @@ describe Chef::Knife::Ec2ServerCreate do
                            :key_name => 'my_ssh_key',
                            :groups => ['group1', 'group2'],
                            :dns_name => 'ec2-75.101.253.10.compute-1.amazonaws.com',
-                           :ip_address => '75.101.253.10',
+                           :public_ip_address => '75.101.253.10',
                            :private_dns_name => 'ip-10-251-75-20.ec2.internal',
-                           :private_ip_address => '10.251.75.20' }
+                           :private_ip_address => '10.251.75.20',
+                           :root_device_type => 'not_ebs' }
 
     @ec2_server_attribs.each_pair do |attrib, value|
       @new_ec2_server.stub!(attrib).and_return(value)
@@ -71,11 +83,13 @@ describe Chef::Knife::Ec2ServerCreate do
     before do
       @knife_ec2_create.config[:ssh_user] = "ubuntu"
       @knife_ec2_create.config[:identity_file] = "~/.ssh/aws-key.pem"
+      @knife_ec2_create.config[:ssh_port] = 22
       @knife_ec2_create.config[:chef_node_name] = "blarf"
       @knife_ec2_create.config[:template_file] = '~/.chef/templates/my-bootstrap.sh.erb'
       @knife_ec2_create.config[:distro] = 'ubuntu-10.04-magic-sparkles'
+      @knife_ec2_create.config[:run_list] = ['role[base]']
 
-      @bootstrap = @knife_ec2_create.bootstrap_for_node(@new_ec2_server)
+      @bootstrap = @knife_ec2_create.bootstrap_for_node(@new_ec2_server, @new_ec2_server.dns_name)
     end
 
     it "should set the bootstrap 'name argument' to the hostname of the EC2 server" do
@@ -94,6 +108,10 @@ describe Chef::Knife::Ec2ServerCreate do
       @bootstrap.config[:identity_file].should == "~/.ssh/aws-key.pem"
     end
 
+    it "configures the bootstrap to use the correct ssh_port number" do
+      @bootstrap.config[:ssh_port].should == 22
+    end
+
     it "configures the bootstrap to use the configured node name if provided" do
       @bootstrap.config[:chef_node_name].should == 'blarf'
     end
@@ -101,7 +119,7 @@ describe Chef::Knife::Ec2ServerCreate do
     it "configures the bootstrap to use the EC2 server id if no explicit node name is set" do
       @knife_ec2_create.config[:chef_node_name] = nil
 
-      bootstrap = @knife_ec2_create.bootstrap_for_node(@new_ec2_server)
+      bootstrap = @knife_ec2_create.bootstrap_for_node(@new_ec2_server, @new_ec2_server.dns_name)
       bootstrap.config[:chef_node_name].should == @new_ec2_server.id
     end
 
@@ -110,7 +128,7 @@ describe Chef::Knife::Ec2ServerCreate do
 
       @knife_ec2_create.config[:prerelease] = true
 
-      bootstrap = @knife_ec2_create.bootstrap_for_node(@new_ec2_server)
+      bootstrap = @knife_ec2_create.bootstrap_for_node(@new_ec2_server, @new_ec2_server.dns_name)
       bootstrap.config[:prerelease].should be_true
     end
 

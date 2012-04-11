@@ -1,6 +1,7 @@
 #
 # Author:: Adam Jacob (<adam@opscode.com>)
-# Copyright:: Copyright (c) 2009 Opscode, Inc.
+# Author:: Seth Chisamore (<schisamo@opscode.com>)
+# Copyright:: Copyright (c) 2009-2011 Opscode, Inc.
 # License:: Apache License, Version 2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,77 +17,90 @@
 # limitations under the License.
 #
 
-require 'chef/knife'
+require 'chef/knife/ec2_base'
+
+# These two are needed for the '--purge' deletion case
+require 'chef/node'
+require 'chef/api_client'
 
 class Chef
   class Knife
     class Ec2ServerDelete < Knife
 
-      deps do
-        require 'fog'
-        require 'net/ssh/multi'
-        require 'readline'
-        require 'chef/json_compat'
-      end
+      include Knife::Ec2Base
 
       banner "knife ec2 server delete SERVER [SERVER] (options)"
 
-      option :aws_access_key_id,
-        :short => "-A ID",
-        :long => "--aws-access-key-id KEY",
-        :description => "Your AWS Access Key ID",
-        :proc => Proc.new { |key| Chef::Config[:knife][:aws_access_key_id] = key }
+      option :purge,
+        :short => "-P",
+        :long => "--purge",
+        :boolean => true,
+        :default => false,
+        :description => "Destroy corresponding node and client on the Chef Server, in addition to destroying the EC2 node itself.  Assumes node and client have the same name as the server (if not, add the '--node-name' option)."
 
-      option :aws_secret_access_key,
-        :short => "-K SECRET",
-        :long => "--aws-secret-access-key SECRET",
-        :description => "Your AWS API Secret Access Key",
-        :proc => Proc.new { |key| Chef::Config[:knife][:aws_secret_access_key] = key }
+      option :chef_node_name,
+        :short => "-N NAME",
+        :long => "--node-name NAME",
+        :description => "The name of the node and client to delete, if it differs from the server name.  Only has meaning when used with the '--purge' option."
 
-      option :region,
-        :long => "--region REGION",
-        :description => "Your AWS region",
-        :default => "us-east-1",
-        :proc => Proc.new { |key| Chef::Config[:knife][:region] = key }
-
-      def run
-        connection = Fog::Compute.new(
-          :provider => 'AWS',
-          :aws_access_key_id => Chef::Config[:knife][:aws_access_key_id],
-          :aws_secret_access_key => Chef::Config[:knife][:aws_secret_access_key],
-          :region => Chef::Config[:knife][:region] || config[:region]
-        )
-
-        @name_args.each do |instance_id|
-          server = connection.servers.get(instance_id)
-
-          msg("Instance ID", server.id)
-          msg("Flavor", server.flavor_id)
-          msg("Image", server.image_id)
-          msg("Availability Zone", server.availability_zone)
-          msg("Security Groups", server.groups.join(", "))
-          msg("SSH Key", server.key_name)
-          msg("Public DNS Name", server.dns_name)
-          msg("Public IP Address", server.public_ip_address)
-          msg("Private DNS Name", server.private_dns_name)
-          msg("Private IP Address", server.private_ip_address)
-
-          puts "\n"
-          confirm("Do you really want to delete this server")
-
-          server.destroy
-
-          ui.warn("Deleted server #{server.id}")
+      # Extracted from Chef::Knife.delete_object, because it has a
+      # confirmation step built in... By specifying the '--purge'
+      # flag (and also explicitly confirming the server destruction!)
+      # the user is already making their intent known.  It is not
+      # necessary to make them confirm two more times.
+      def destroy_item(klass, name, type_name)
+        begin
+          object = klass.load(name)
+          object.destroy
+          ui.warn("Deleted #{type_name} #{name}")
+        rescue Net::HTTPServerException
+          ui.warn("Could not find a #{type_name} named #{name} to delete!")
         end
       end
 
-      def msg(label, value)
-        if value && !value.empty?
-          puts "#{ui.color(label, :cyan)}: #{value}"
+      def run
+
+        validate!
+
+        @name_args.each do |instance_id|
+
+          begin
+            server = connection.servers.get(instance_id)
+
+            msg_pair("Instance ID", server.id)
+            msg_pair("Flavor", server.flavor_id)
+            msg_pair("Image", server.image_id)
+            msg_pair("Region", connection.instance_variable_get(:@region))
+            msg_pair("Availability Zone", server.availability_zone)
+            msg_pair("Security Groups", server.groups.join(", "))
+            msg_pair("SSH Key", server.key_name)
+            msg_pair("Root Device Type", server.root_device_type)
+            msg_pair("Public DNS Name", server.dns_name)
+            msg_pair("Public IP Address", server.public_ip_address)
+            msg_pair("Private DNS Name", server.private_dns_name)
+            msg_pair("Private IP Address", server.private_ip_address)
+
+            puts "\n"
+            confirm("Do you really want to delete this server")
+
+            server.destroy
+
+            ui.warn("Deleted server #{server.id}")
+
+            if config[:purge]
+              thing_to_delete = config[:chef_node_name] || instance_id
+              destroy_item(Chef::Node, thing_to_delete, "node")
+              destroy_item(Chef::ApiClient, thing_to_delete, "client")
+            else
+              ui.warn("Corresponding node and client for the #{instance_id} server were not deleted and remain registered with the Chef Server")
+            end
+
+          rescue NoMethodError
+            ui.error("Could not locate server '#{instance_id}'.  Please verify it was provisioned in the '#{locate_config_value(:region)}' region.")
+          end
         end
       end
 
     end
   end
 end
-
